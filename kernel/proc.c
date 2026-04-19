@@ -124,7 +124,16 @@ allocproc(void)
 found:
   p->pid = allocpid();
   p->state = USED;
-
+  
+  // Allocate 1 page for usyscall
+  p->usyscall = (struct usyscall*)kalloc();
+  if(p->usyscall == 0){
+  freeproc(p); // If allocation fails, clean up and abort
+  release(&p->lock);
+  return 0;
+  }
+  p->usyscall->pid = p->pid; //store PID so user can read
+  
   // Allocate a trapframe page.
   if((p->trapframe = (struct trapframe *)kalloc()) == 0){
     freeproc(p);
@@ -160,6 +169,9 @@ freeproc(struct proc *p)
   p->trapframe = 0;
   if(p->pagetable)
     proc_freepagetable(p->pagetable, p->sz);
+  if(p->usyscall)
+    kfree((void*)p->usyscall);
+  p->usyscall = 0;
   p->pagetable = 0;
   p->sz = 0;
   p->pid = 0;
@@ -201,7 +213,17 @@ proc_pagetable(struct proc *p)
     uvmfree(pagetable, 0);
     return 0;
   }
-
+  
+  // Map USYSCALL page into user space
+  if(mappages(pagetable, USYSCALL, PGSIZE,
+            (uint64)p->usyscall,
+            PTE_R | PTE_U) < 0){ // User can only read
+    // On failure, undo earlier mappings
+    uvmunmap(pagetable, TRAPFRAME, 1, 0);
+    uvmunmap(pagetable, TRAMPOLINE, 1, 0);
+    uvmfree(pagetable, 0);
+    return 0;
+  }
   return pagetable;
 }
 
@@ -212,6 +234,7 @@ proc_freepagetable(pagetable_t pagetable, uint64 sz)
 {
   uvmunmap(pagetable, TRAMPOLINE, 1, 0);
   uvmunmap(pagetable, TRAPFRAME, 1, 0);
+  uvmunmap(pagetable, USYSCALL, 1, 0); //Unmap the USYSCALL page
   uvmfree(pagetable, sz);
 }
 
