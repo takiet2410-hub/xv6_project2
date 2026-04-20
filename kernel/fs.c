@@ -385,6 +385,9 @@ bmap(struct inode *ip, uint bn)
   uint addr, *a;
   struct buf *bp;
 
+  // ============================================================
+  // PHẦN 1: Direct blocks — bn = 0 .. NDIRECT-1 (tức 0..10)
+  // ============================================================
   if(bn < NDIRECT){
     if((addr = ip->addrs[bn]) == 0){
       addr = balloc(ip->dev);
@@ -394,10 +397,13 @@ bmap(struct inode *ip, uint bn)
     }
     return addr;
   }
-  bn -= NDIRECT;
+  bn -= NDIRECT;  // Sau dòng này, bn là offset tính từ đầu vùng indirect
 
+  // ============================================================
+  // PHẦN 2: Singly-indirect — bn = 0..255
+  //   addrs[NDIRECT] = addrs[11] trỏ đến 1 block chứa 256 địa chỉ
+  // ============================================================
   if(bn < NINDIRECT){
-    // Load indirect block, allocating if necessary.
     if((addr = ip->addrs[NDIRECT]) == 0){
       addr = balloc(ip->dev);
       if(addr == 0)
@@ -410,10 +416,65 @@ bmap(struct inode *ip, uint bn)
       addr = balloc(ip->dev);
       if(addr){
         a[bn] = addr;
-        log_write(bp);
+        log_write(bp);  // Chỉ log_write khi GHI mới vào block
       }
     }
     brelse(bp);
+    return addr;
+  }
+  bn -= NINDIRECT;  // Sau dòng này, bn là offset trong vùng doubly-indirect
+
+  // ============================================================
+  // PHẦN 3: Doubly-indirect — bn = 0..65535
+  //   addrs[NDIRECT+1] = addrs[12] trỏ đến block cấp 1
+  //   Block cấp 1 chứa 256 địa chỉ, mỗi địa chỉ trỏ đến block cấp 2
+  //   Block cấp 2 chứa 256 địa chỉ data block thực sự
+  // ============================================================
+  if(bn < NINDIRECT * NINDIRECT){
+
+    // --- Bước 3a: Load / Allocate doubly-indirect block (block cấp 1) ---
+    // addrs[NDIRECT+1] là slot addrs[12] — slot mới ta thêm vào
+    if((addr = ip->addrs[NDIRECT+1]) == 0){
+      addr = balloc(ip->dev);
+      if(addr == 0)
+        return 0;
+      ip->addrs[NDIRECT+1] = addr;
+    }
+    bp = bread(ip->dev, addr);       // bp = buffer chứa block cấp 1
+    a = (uint*)bp->data;             // a[0..255] = các địa chỉ block cấp 2
+
+    // --- Bước 3b: Tính index vào block cấp 1 và load block cấp 2 ---
+    // bn / NINDIRECT = chọn singly-indirect nào trong 256 cái
+    // Ví dụ bn=300: 300/256=1 → lấy a[1] = địa chỉ block cấp 2 số 1
+    uint dbl_idx = bn / NINDIRECT;
+    if((addr = a[dbl_idx]) == 0){
+      addr = balloc(ip->dev);
+      if(addr){
+        a[dbl_idx] = addr;
+        log_write(bp);               // Ghi vào block cấp 1 → phải log_write
+      }
+    }
+    brelse(bp);                      // ← LUÔN brelse ngay sau khi xong với bp
+
+    if(addr == 0)
+      return 0;
+
+    // --- Bước 3c: Load block cấp 2 và tìm data block thực sự ---
+    // bn % NINDIRECT = vị trí trong block cấp 2
+    // Ví dụ bn=300: 300%256=44 → lấy a2[44] = địa chỉ data block
+    bp = bread(ip->dev, addr);       // bp = buffer chứa block cấp 2
+    a = (uint*)bp->data;             // a[0..255] = các địa chỉ data block
+
+    uint sin_idx = bn % NINDIRECT;
+    if((addr = a[sin_idx]) == 0){
+      addr = balloc(ip->dev);
+      if(addr){
+        a[sin_idx] = addr;
+        log_write(bp);               // Ghi vào block cấp 2 → phải log_write
+      }
+    }
+    brelse(bp);                      // ← LUÔN brelse ngay sau khi xong với bp
+
     return addr;
   }
 
@@ -426,9 +487,12 @@ void
 itrunc(struct inode *ip)
 {
   int i, j;
-  struct buf *bp;
-  uint *a;
+  struct buf *bp, *bp2;   // bp = doubly-indirect, bp2 = singly-indirect
+  uint *a, *a2;           // a  = array trong doubly, a2 = array trong singly
 
+  // ============================================================
+  // PHẦN 1: Giải phóng direct blocks (addrs[0..10])
+  // ============================================================
   for(i = 0; i < NDIRECT; i++){
     if(ip->addrs[i]){
       bfree(ip->dev, ip->addrs[i]);
@@ -436,16 +500,51 @@ itrunc(struct inode *ip)
     }
   }
 
+  // ============================================================
+  // PHẦN 2: Giải phóng singly-indirect block (addrs[11])
+  //   Duyệt 256 data blocks bên trong rồi free block index
+  // ============================================================
   if(ip->addrs[NDIRECT]){
     bp = bread(ip->dev, ip->addrs[NDIRECT]);
     a = (uint*)bp->data;
     for(j = 0; j < NINDIRECT; j++){
       if(a[j])
-        bfree(ip->dev, a[j]);
+        bfree(ip->dev, a[j]);   // Free 256 data blocks
     }
     brelse(bp);
-    bfree(ip->dev, ip->addrs[NDIRECT]);
+    bfree(ip->dev, ip->addrs[NDIRECT]);  // Free chính block index
     ip->addrs[NDIRECT] = 0;
+  }
+
+  // ============================================================
+  // PHẦN 3: Giải phóng doubly-indirect block (addrs[12])
+  //   Thứ tự BẮT BUỘC: data blocks → singly-indirect → doubly-indirect
+  //   (Không được free block cha trước khi đọc xong con trỏ bên trong)
+  // ============================================================
+  if(ip->addrs[NDIRECT+1]){
+    // Bước 3a: Đọc block cấp 1 (doubly-indirect block)
+    bp = bread(ip->dev, ip->addrs[NDIRECT+1]);
+    a = (uint*)bp->data;  // a[0..255] = địa chỉ các block cấp 2
+
+    for(i = 0; i < NINDIRECT; i++){
+      if(a[i]){
+        // Bước 3b: Đọc block cấp 2 (singly-indirect block thứ i)
+        bp2 = bread(ip->dev, a[i]);
+        a2 = (uint*)bp2->data;  // a2[0..255] = địa chỉ data blocks
+
+        // Bước 3c: Free toàn bộ data blocks trong block cấp 2
+        for(j = 0; j < NINDIRECT; j++){
+          if(a2[j])
+            bfree(ip->dev, a2[j]);   // Free data block
+        }
+        brelse(bp2);                 // Release buffer của block cấp 2
+
+        bfree(ip->dev, a[i]);        // Free chính block cấp 2
+      }
+    }
+    brelse(bp);                      // Release buffer của block cấp 1
+    bfree(ip->dev, ip->addrs[NDIRECT+1]);  // Free chính block cấp 1
+    ip->addrs[NDIRECT+1] = 0;
   }
 
   ip->size = 0;
